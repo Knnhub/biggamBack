@@ -340,6 +340,7 @@ func withCORS(h http.HandlerFunc) http.HandlerFunc {
 			"http://localhost:3000",
 			"http://localhost:51560",
 			"https://big-game-460e6.web.app", // ใส่ domain ของ frontend production ตรงนี้
+
 		}
 
 		// ตรวจสอบว่า origin ที่ส่งมาถูก whitelist ไว้หรือไม่
@@ -1024,25 +1025,87 @@ func getDiscountCodesHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rows, err := db.Query("SELECT code_id, code, discount_type, discount_value, expiry_date, usage_limit, times_used, is_active FROM discount_codes ORDER BY code_id DESC")
+	// ใช้ COALESCE กัน NULL สำหรับเลข/บูลีน
+	rows, err := db.Query(`
+		SELECT
+			code_id,
+			code,
+			discount_type,
+			discount_value,
+			expiry_date,
+			COALESCE(usage_limit, 0)  AS usage_limit,
+			COALESCE(times_used, 0)   AS times_used,
+			COALESCE(is_active, 1)    AS is_active
+		FROM discount_codes
+		ORDER BY code_id DESC`)
 	if err != nil {
 		http.Error(w, `{"error":"Database query error"}`, http.StatusInternalServerError)
 		return
 	}
 	defer rows.Close()
 
+	type rowDC struct {
+		codeID        int
+		code          sql.NullString
+		discountType  sql.NullString
+		discountValue sql.NullFloat64
+		expiryDate    sql.NullTime
+		usageLimit    sql.NullInt64
+		timesUsed     sql.NullInt64
+		isActive      sql.NullInt64 // tinyint(1)
+	}
+
 	var codes []DiscountCode
 	for rows.Next() {
-		var dc DiscountCode
-		if err := rows.Scan(&dc.CodeID, &dc.Code, &dc.DiscountType, &dc.DiscountValue, &dc.ExpiryDate, &dc.UsageLimit, &dc.TimesUsed, &dc.IsActive); err != nil {
+		var r rowDC
+		if err := rows.Scan(
+			&r.codeID,
+			&r.code,
+			&r.discountType,
+			&r.discountValue,
+			&r.expiryDate,
+			&r.usageLimit,
+			&r.timesUsed,
+			&r.isActive,
+		); err != nil {
+			log.Printf("scan error in /discount-codes: %v", err) // ✅ log เพิ่ม
 			http.Error(w, `{"error":"Failed to scan row"}`, http.StatusInternalServerError)
 			return
 		}
-		codes = append(codes, dc)
+
+		var t *time.Time
+		if r.expiryDate.Valid {
+			tmp := r.expiryDate.Time
+			t = &tmp
+		}
+
+		codes = append(codes, DiscountCode{
+			CodeID:        r.codeID,
+			Code:          ifNullStr(r.code),
+			DiscountType:  ifNullStr(r.discountType),
+			DiscountValue: ifNullF64(r.discountValue, 0),
+			ExpiryDate:    t,
+			UsageLimit:    int(r.usageLimit.Int64),
+			TimesUsed:     int(r.timesUsed.Int64),
+			IsActive:      r.isActive.Int64 == 1,
+		})
 	}
+
+	if err := rows.Err(); err != nil {
+		http.Error(w, `{"error":"Row iteration error"}`, http.StatusInternalServerError)
+		return
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(codes)
 }
+
+func ifNullStr(s sql.NullString) string       { if s.Valid { return s.String }; return "" }
+func ifNullF64(n sql.NullFloat64, d float64) float64 {
+	if n.Valid { return n.Float64 }
+	return d
+}
+
 
 // --- 2. Handler สำหรับ POST (เพิ่มข้อมูล) ---
 func addDiscountCodeHandler(w http.ResponseWriter, r *http.Request) {
